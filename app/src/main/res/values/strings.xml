@@ -1,0 +1,5 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BiliPartFix</string>
+    <string name="module_description">Fix Bilibili 7.4.0 multipart playback, modern comments, EVA3 articles, and small-station posts.</string>
+</resources>
