@@ -11,15 +11,15 @@ if (signingPropertiesFile.isFile()) {
 }
 
 android {
-    namespace 'com.bilipartfix'
+    namespace 'io.github.yylsping.bilipartfix'
     compileSdk 36
 
     defaultConfig {
-        applicationId 'com.bilipartfix'
+        applicationId 'io.github.yylsping.bilipartfix'
         minSdk 27
         targetSdk 35
-        versionCode 6
-        versionName '1.4.0'
+        versionCode 7
+        versionName '1.4.1'
     }
 
     signingConfigs {

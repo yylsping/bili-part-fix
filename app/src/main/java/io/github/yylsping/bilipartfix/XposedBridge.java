@@ -1,4 +1,4 @@
-package com.bilipartfix;
+package io.github.yylsping.bilipartfix;
 
 import android.util.Log;
 

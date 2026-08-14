@@ -1,4 +1,4 @@
-package com.bilipartfix;
+package io.github.yylsping.bilipartfix;
 
 import android.app.Application;
 import android.content.Context;
@@ -22,7 +22,7 @@ public final class BiliPartFixHook extends XposedModule {
     private static final String DETAIL_CLASS =
             "tv.danmaku.bili.videopage.data.view.model.BiliVideoDetail";
     private static final String EXTRA_ORIGINAL_SEASON =
-            "com.bilipartfix.originalUgcSeason";
+            "io.github.yylsping.bilipartfix.originalUgcSeason";
 
     private final AtomicBoolean installed = new AtomicBoolean(false);
     private String processName = "";

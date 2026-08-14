@@ -1,4 +1,4 @@
-package com.bilipartfix;
+package io.github.yylsping.bilipartfix;
 
 import android.app.Dialog;
 import android.graphics.Color;
