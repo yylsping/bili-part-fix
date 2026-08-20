@@ -61,6 +61,8 @@ final class CommentImageFix {
     private static final String IMAGE_ITEM =
             "com.bilibili.lib.imageviewer.data.ImageItem";
     private static final int MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_REPLY_PAGES = 3;
+    private static final int MAX_PENDING_TARGETS_PER_KEY = 24;
 
     private static final Map<Object, Object> COMMENTS_BY_VIEW_MODEL =
             Collections.synchronizedMap(new WeakHashMap<>());
@@ -70,12 +72,14 @@ final class CommentImageFix {
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final Map<View, Integer> BIND_GENERATIONS =
             Collections.synchronizedMap(new WeakHashMap<>());
-    private static final Map<View, SlotState> SLOT_STATES =
+    private static final Map<View, WeakReference<SlotState>> SLOT_STATES =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final Map<TextView, MarkerWatchState> MARKER_WATCHERS =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final MemoryCache<String, ReplyPictures> CACHE =
             new MemoryCache<>(128, 30L * 60L * 1000L, 45L * 1000L);
+    private static final MemoryCache<String, Boolean> TRANSIENT_BACKOFF =
+            new MemoryCache<>(128, 2L * 1000L, 2L * 1000L);
     private static final MemoryCache<String, Boolean> RESTORE_LOGS =
             new MemoryCache<>(256, 30L * 60L * 1000L, 30L * 60L * 1000L);
     private static final Set<String> IN_FLIGHT = ConcurrentHashMap.newKeySet();
@@ -248,6 +252,7 @@ final class CommentImageFix {
             }
             return;
         }
+        if (TRANSIENT_BACKOFF.get(key).present) return;
         queueRenderTarget(key, messageView, itemView, generation);
         // Close the race where the worker publishes/removes its pending list
         // just as another bind appends a target. If the result appeared after
@@ -261,20 +266,28 @@ final class CommentImageFix {
             }
             return;
         }
+        if (TRANSIENT_BACKOFF.get(key).present) {
+            PENDING_TARGETS.remove(key);
+            return;
+        }
         if (!IN_FLIGHT.add(key)) return;
         NETWORK.execute(() -> {
             try {
-                ReplyPictures result = fetch(type, oid, root, rpid);
-                if (result != null && !result.pictures.isEmpty()) {
-                    CACHE.put(key, result);
-                    deliverRenderTargets(key, result);
-                } else {
+                FetchResult result = fetch(type, oid, root, rpid);
+                if (result.status == FetchStatus.SUCCESS) {
+                    CACHE.put(key, result.pictures);
+                    deliverRenderTargets(key, result.pictures);
+                } else if (result.status == FetchStatus.DEFINITIVE_EMPTY) {
                     CACHE.put(key, null);
+                    PENDING_TARGETS.remove(key);
+                } else {
+                    TRANSIENT_BACKOFF.put(key, Boolean.TRUE);
                     PENDING_TARGETS.remove(key);
                 }
             } catch (Throwable throwable) {
+                TRANSIENT_BACKOFF.put(key, Boolean.TRUE);
                 PENDING_TARGETS.remove(key);
-                XposedBridge.log("BiliPartFix: picture lookup failed for rpid=" + rpid
+                XposedBridge.log("BiliPartFix: picture lookup deferred for rpid=" + rpid
                         + ": " + throwable.getClass().getSimpleName());
             } finally {
                 IN_FLIGHT.remove(key);
@@ -284,9 +297,27 @@ final class CommentImageFix {
 
     private static void queueRenderTarget(String key, TextView messageView, View itemView,
                                           int generation) {
-        List<RenderTarget> targets = PENDING_TARGETS.computeIfAbsent(
-                key, ignored -> Collections.synchronizedList(new ArrayList<>()));
-        targets.add(new RenderTarget(messageView, itemView, generation));
+        PENDING_TARGETS.compute(key, (ignored, existing) -> {
+            List<RenderTarget> targets = existing == null ? new ArrayList<>() : existing;
+            synchronized (targets) {
+                for (int i = targets.size() - 1; i >= 0; i--) {
+                    RenderTarget target = targets.get(i);
+                    if (target.isDead()) {
+                        targets.remove(i);
+                    } else if (target.matches(itemView, generation)) {
+                        // Refresh the weak TextView reference without multiplying
+                        // the three delayed Main Looper deliveries for one holder.
+                        targets.set(i, new RenderTarget(messageView, itemView, generation));
+                        return targets;
+                    }
+                }
+                if (targets.size() >= MAX_PENDING_TARGETS_PER_KEY) {
+                    targets.remove(0);
+                }
+                targets.add(new RenderTarget(messageView, itemView, generation));
+            }
+            return targets;
+        });
     }
 
     private static void deliverRenderTargets(String key, ReplyPictures result) {
@@ -388,7 +419,7 @@ final class CommentImageFix {
                         ? "共" + result.pictures.size() + "张图片，点击查看全部"
                         : "评论图片，点击查看大图");
                 image.setOnClickListener(
-                        v -> showNativePictureViewer(messageView, result, clickedIndex));
+                        v -> showNativePictureViewer(v, result, clickedIndex));
                 loadWithBiliImageLoader(messageView, image, picture.url);
             }
             // Do not remove the server marker until every image request has
@@ -412,7 +443,7 @@ final class CommentImageFix {
     }
 
     private static View[] ensureBiliImageSlots(View itemView) {
-        SlotState existing = SLOT_STATES.get(itemView);
+        SlotState existing = slotState(itemView);
         if (existing != null) return existing.replacements;
         String[] names = {"pre_triple_image_first", "pre_triple_image_second",
                 "pre_triple_image_third"};
@@ -434,14 +465,25 @@ final class CommentImageFix {
             replacements[i] = replacement;
         }
         SlotState state = new SlotState(originals, replacements);
-        SLOT_STATES.put(itemView, state);
+        // The item owns the state through this no-op lifecycle listener. The
+        // static map keeps only weak edges, so neither the original views'
+        // Activity Context nor replacement->parent can retain a dead page.
+        itemView.addOnAttachStateChangeListener(state);
+        SLOT_STATES.put(itemView, new WeakReference<>(state));
         return replacements;
+    }
+
+    private static SlotState slotState(View itemView) {
+        WeakReference<SlotState> reference = SLOT_STATES.get(itemView);
+        return reference == null ? null : reference.get();
     }
 
     private static void restoreOriginalSlots(View itemView) {
         RENDERED_KEYS.remove(itemView);
-        SlotState state = SLOT_STATES.remove(itemView);
+        WeakReference<SlotState> reference = SLOT_STATES.remove(itemView);
+        SlotState state = reference == null ? null : reference.get();
         if (state == null) return;
+        itemView.removeOnAttachStateChangeListener(state);
         for (int i = 0; i < state.replacements.length; i++) {
             View replacement = state.replacements[i];
             View original = state.originals[i];
@@ -532,15 +574,20 @@ final class CommentImageFix {
     private static void showNativePictureViewer(View anchor, ReplyPictures result,
                                                 int clickedIndex) {
         try {
+            if (result == null || result.pictures == null || result.pictures.isEmpty()) return;
             Activity activity = findActivity(anchor.getContext());
-            if (activity == null) throw new IllegalStateException("activity context unavailable");
+            if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
             Class<?> imageItemClass = XposedHelpers.findClass(IMAGE_ITEM, appClassLoader);
             List<Object> items = new ArrayList<>(result.pictures.size());
             for (Picture picture : result.pictures) {
+                if (picture == null) return;
                 String url = normalizeUrl(picture.url);
+                if (url.isEmpty()) return;
                 items.add(XposedHelpers.newInstance(imageItemClass,
-                        url, null, url, url, picture.width, picture.height, 0));
+                        url, null, url, url, Math.max(0, picture.width),
+                        Math.max(0, picture.height), 0));
             }
+            if (items.isEmpty()) return;
             Class<?> modelClass = XposedHelpers.findClass(IMAGE_VIEWER_MODEL, appClassLoader);
             Object model = XposedHelpers.newInstance(modelClass, activity);
             XposedHelpers.callMethod(model, "d", items);
@@ -566,6 +613,7 @@ final class CommentImageFix {
     }
 
     private static String normalizeUrl(String rawUrl) {
+        if (rawUrl == null) return "";
         return rawUrl.startsWith("http://")
                 ? "https://" + rawUrl.substring("http://".length()) : rawUrl;
     }
@@ -609,44 +657,88 @@ final class CommentImageFix {
         return null;
     }
 
-    private static ReplyPictures fetch(int type, long oid, long root, long rpid)
+    private static FetchResult fetch(int type, long oid, long root, long rpid)
             throws Exception {
-        String endpoint = "https://api.bilibili.com/x/v2/reply/detail?type=" + type
+        String detailEndpoint = "https://api.bilibili.com/x/v2/reply/detail?type=" + type
                 + "&oid=" + oid + "&root=" + root + "&ps=20&pn=1";
+        JSONObject data = requestReplyData(detailEndpoint);
+        JSONObject reply = findReply(data.optJSONObject("root"), rpid);
+        if (reply == null) {
+            reply = findReply(data.optJSONArray("replies"), rpid);
+        }
+
+        // reply/detail currently returns the same first child page for pn>1.
+        // Only a known child reply needs this bounded fallback; roots and
+        // top-level comments stop after the single detail request.
+        if (reply == null && rpid != root) {
+            for (int pageNumber = 1; pageNumber <= MAX_REPLY_PAGES; pageNumber++) {
+                String pageEndpoint = "https://api.bilibili.com/x/v2/reply/reply?type=" + type
+                        + "&oid=" + oid + "&root=" + root + "&ps=20&pn=" + pageNumber;
+                JSONObject pageData = requestReplyData(pageEndpoint);
+                JSONArray replies = pageData.optJSONArray("replies");
+                reply = findReply(replies, rpid);
+                if (reply != null) break;
+                if (replies == null || replies.length() == 0
+                        || isLastReplyPage(pageData, pageNumber)) break;
+            }
+        }
+        if (reply == null) return FetchResult.transientFailure();
+
+        JSONObject content = reply.optJSONObject("content");
+        if (content == null) return FetchResult.transientFailure();
+        JSONArray picturesJson = content.optJSONArray("pictures");
+        if (!content.has("pictures") || content.isNull("pictures")) {
+            return FetchResult.definitiveEmpty();
+        }
+        if (picturesJson == null) return FetchResult.transientFailure();
+        if (picturesJson.length() == 0) return FetchResult.definitiveEmpty();
+        List<Picture> pictures = new ArrayList<>();
+        for (int i = 0; i < picturesJson.length() && i < 9; i++) {
+            JSONObject pictureJson = picturesJson.optJSONObject(i);
+            if (pictureJson == null) continue;
+            String url = pictureJson.optString("img_src", "");
+            if (!url.startsWith("http://") && !url.startsWith("https://")) continue;
+            pictures.add(new Picture(url, pictureJson.optInt("img_width"),
+                    pictureJson.optInt("img_height")));
+        }
+        return pictures.isEmpty()
+                ? FetchResult.transientFailure()
+                : FetchResult.success(new ReplyPictures(rpid, pictures));
+    }
+
+    private static JSONObject requestReplyData(String endpoint) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
         connection.setConnectTimeout(8000);
         connection.setReadTimeout(10000);
         connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("Accept", "application/json");
         connection.setRequestProperty("Accept-Encoding", "identity");
-        connection.setRequestProperty("User-Agent", "BiliPartFix/1.5 (Android)");
+        connection.setRequestProperty("User-Agent", "BiliPartFix/1.5.1 (Android)");
         try {
-            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
+            int responseCode = connection.getResponseCode();
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                throw new TransientLookupException("HTTP " + responseCode);
+            }
             byte[] bytes = readBounded(connection);
             JSONObject envelope = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            if (envelope.optInt("code", -1) != 0) return null;
+            int apiCode = envelope.optInt("code", -1);
+            if (apiCode != 0) {
+                throw new TransientLookupException("API " + apiCode);
+            }
             JSONObject data = envelope.optJSONObject("data");
-            JSONObject reply = findReply(data == null ? null : data.optJSONObject("root"), rpid);
-            if (reply == null && data != null) {
-                reply = findReply(data.optJSONArray("replies"), rpid);
-            }
-            if (reply == null) return null;
-            JSONObject content = reply.optJSONObject("content");
-            JSONArray picturesJson = content == null ? null : content.optJSONArray("pictures");
-            if (picturesJson == null || picturesJson.length() == 0) return null;
-            List<Picture> pictures = new ArrayList<>();
-            for (int i = 0; i < picturesJson.length() && i < 9; i++) {
-                JSONObject p = picturesJson.optJSONObject(i);
-                if (p == null) continue;
-                String url = p.optString("img_src", "");
-                if (!url.startsWith("http://") && !url.startsWith("https://")) continue;
-                pictures.add(new Picture(url, p.optInt("img_width"),
-                        p.optInt("img_height")));
-            }
-            return pictures.isEmpty() ? null : new ReplyPictures(rpid, pictures);
+            if (data == null) throw new TransientLookupException("missing data");
+            return data;
         } finally {
             connection.disconnect();
         }
+    }
+
+    private static boolean isLastReplyPage(JSONObject data, int pageNumber) {
+        JSONObject page = data.optJSONObject("page");
+        if (page == null) return false;
+        int count = page.optInt("count", -1);
+        int size = page.optInt("size", 20);
+        return count >= 0 && size > 0 && pageNumber * size >= count;
     }
 
     private static byte[] readBounded(HttpURLConnection connection) throws Exception {
@@ -729,13 +821,16 @@ final class CommentImageFix {
             if (existing != null) {
                 messageView.removeOnLayoutChangeListener(existing.listener);
             }
+            WeakReference<View> itemReference = new WeakReference<>(itemView);
             View.OnLayoutChangeListener listener = (view, left, top, right, bottom,
                                                      oldLeft, oldTop, oldRight, oldBottom) -> {
-                if (key.equals(BOUND_KEYS.get(itemView))
-                        && generation == currentGeneration(itemView)) {
+                View currentItem = itemReference.get();
+                if (currentItem != null && view instanceof TextView
+                        && key.equals(BOUND_KEYS.get(currentItem))
+                        && generation == currentGeneration(currentItem)) {
                     MemoryCache.Lookup<ReplyPictures> cached = CACHE.get(key);
                     if (cached.present && cached.value != null) {
-                        stripUpgradeMarker(messageView);
+                        stripUpgradeMarker((TextView) view);
                     }
                 }
             };
@@ -837,13 +932,58 @@ final class CommentImageFix {
         }
     }
 
-    private static final class SlotState {
+    private enum FetchStatus {
+        SUCCESS,
+        DEFINITIVE_EMPTY,
+        TRANSIENT_FAILURE
+    }
+
+    private static final class FetchResult {
+        final FetchStatus status;
+        final ReplyPictures pictures;
+
+        private FetchResult(FetchStatus status, ReplyPictures pictures) {
+            this.status = status;
+            this.pictures = pictures;
+        }
+
+        static FetchResult success(ReplyPictures pictures) {
+            return new FetchResult(FetchStatus.SUCCESS, pictures);
+        }
+
+        static FetchResult definitiveEmpty() {
+            return new FetchResult(FetchStatus.DEFINITIVE_EMPTY, null);
+        }
+
+        static FetchResult transientFailure() {
+            return new FetchResult(FetchStatus.TRANSIENT_FAILURE, null);
+        }
+    }
+
+    private static final class TransientLookupException extends Exception {
+        TransientLookupException(String message) {
+            super(message);
+        }
+    }
+
+    private static final class SlotState implements View.OnAttachStateChangeListener {
         final View[] originals;
         final View[] replacements;
 
         SlotState(View[] originals, View[] replacements) {
             this.originals = originals;
             this.replacements = replacements;
+        }
+
+        @Override
+        public void onViewAttachedToWindow(View view) {
+            // The item owns this state; rendering is driven only by bind events.
+        }
+
+        @Override
+        public void onViewDetachedFromWindow(View view) {
+            // Do not restore on RecyclerView detach: off-screen picture rows
+            // must return without flicker or another network-dependent bind.
         }
     }
 
@@ -866,6 +1006,14 @@ final class CommentImageFix {
             this.messageView = new WeakReference<>(messageView);
             this.itemView = new WeakReference<>(itemView);
             this.generation = generation;
+        }
+
+        boolean matches(View item, int otherGeneration) {
+            return generation == otherGeneration && itemView.get() == item;
+        }
+
+        boolean isDead() {
+            return messageView.get() == null || itemView.get() == null;
         }
 
         void render(String key, ReplyPictures result) {
