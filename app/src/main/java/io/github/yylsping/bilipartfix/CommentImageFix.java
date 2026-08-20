@@ -1,16 +1,14 @@
 package io.github.yylsping.bilipartfix;
 
-import android.app.Dialog;
+import android.app.Activity;
+import android.content.Context;
+import android.content.ContextWrapper;
 import android.graphics.Color;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.SpannableStringBuilder;
-import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.Window;
-import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -18,6 +16,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -38,9 +37,10 @@ import java.util.concurrent.Executors;
  *
  * <p>7.4.0's generated reply protobuf stops at Content field 8. Picture comments
  * use fields 9 (pictures) and 10 (picture_scale), so the old renderer only gets
- * the server's upgrade marker. For marker-bearing comments only, this bridge
- * obtains the same public reply through x/v2/reply/detail and lets the app's own
- * BiliImageLoader render the returned CDN URLs. Normal comments do no extra I/O.</p>
+ * the server's upgrade marker. For marker-bearing comments (plus the small
+ * pinned/copy-view-model fallback), this bridge obtains the same public reply
+ * through x/v2/reply/detail and lets the app's own image components render the
+ * returned CDN URLs. Normal comments do no extra I/O.</p>
  */
 final class CommentImageFix {
     private static final String VIEW_MODEL =
@@ -56,6 +56,10 @@ final class CommentImageFix {
             "com.bilibili.app.comm.comment2.comments.view.viewholder.PrimaryCommentNormalWithReplyViewHolder";
     private static final String BILI_IMAGE_VIEW = "com.bilibili.lib.image2.view.BiliImageView";
     private static final String BILI_IMAGE_LOADER = "com.bilibili.lib.image2.BiliImageLoader";
+    private static final String IMAGE_VIEWER_MODEL =
+            "com.bilibili.lib.imageviewer.ImageViewerModel";
+    private static final String IMAGE_ITEM =
+            "com.bilibili.lib.imageviewer.data.ImageItem";
     private static final int MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
     private static final Map<Object, Object> COMMENTS_BY_VIEW_MODEL =
@@ -68,11 +72,15 @@ final class CommentImageFix {
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final Map<View, SlotState> SLOT_STATES =
             Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Map<TextView, MarkerWatchState> MARKER_WATCHERS =
+            Collections.synchronizedMap(new WeakHashMap<>());
     private static final MemoryCache<String, ReplyPictures> CACHE =
             new MemoryCache<>(128, 30L * 60L * 1000L, 45L * 1000L);
     private static final MemoryCache<String, Boolean> RESTORE_LOGS =
             new MemoryCache<>(256, 30L * 60L * 1000L, 30L * 60L * 1000L);
     private static final Set<String> IN_FLIGHT = ConcurrentHashMap.newKeySet();
+    private static final ConcurrentHashMap<String, List<RenderTarget>> PENDING_TARGETS =
+            new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Class<?>, IdentityFields> IDENTITY_FIELDS =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Class<?>, Method> IMAGE_INTO_METHODS =
@@ -152,6 +160,8 @@ final class CommentImageFix {
             TextView messageView = (TextView) rawMessage;
             Object viewModel = XposedHelpers.callMethod(adapter, "q0");
             Object comment = COMMENTS_BY_VIEW_MODEL.get(viewModel);
+            boolean pinnedOrCopied = comment == null;
+            boolean rawMarker = containsUpgradeMarker(rawCommentMessage(comment));
             CommentIdentity identity;
             if (comment != null) {
                 identity = new CommentIdentity(
@@ -176,13 +186,23 @@ final class CommentImageFix {
             String previousKey = BOUND_KEYS.put(itemView, key);
             int generation = bindingGeneration(itemView, previousKey, key);
             if (previousKey != null && !previousKey.equals(key)) {
+                clearMarkerWatcher(messageView);
                 restoreOriginalSlots(itemView);
             }
-            if (key.equals(RENDERED_KEYS.get(itemView))) {
-                stripUpgradeMarker(messageView);
+            // p2() can bind the same comment into the same holder again after
+            // the app has hidden/cleared its picture slots. Treat every bind as
+            // a new render opportunity; the memory cache makes this local-only.
+            RENDERED_KEYS.remove(itemView);
+            MemoryCache.Lookup<ReplyPictures> cached = CACHE.get(key);
+            if (cached.present) {
+                if (cached.value != null) {
+                    resetImageSlots(itemView);
+                    renderIfCurrent(messageView, itemView, key, generation, cached.value);
+                }
                 return;
             }
-            if (!containsUpgradeMarker(messageView.getText())) {
+            if (!rawMarker && !containsUpgradeMarker(messageView.getText())
+                    && !pinnedOrCopied) {
                 // CommentMessageWidget applies line collapsing after the holder's
                 // p2() bind returns. On a fresh detail page the server marker can
                 // therefore be absent here and appear a frame later. Retain the
@@ -228,32 +248,73 @@ final class CommentImageFix {
             }
             return;
         }
+        queueRenderTarget(key, messageView, itemView, generation);
+        // Close the race where the worker publishes/removes its pending list
+        // just as another bind appends a target. If the result appeared after
+        // the first lookup, deliver every late target immediately.
+        cached = CACHE.get(key);
+        if (cached.present) {
+            if (cached.value != null) {
+                deliverRenderTargets(key, cached.value);
+            } else {
+                PENDING_TARGETS.remove(key);
+            }
+            return;
+        }
         if (!IN_FLIGHT.add(key)) return;
         NETWORK.execute(() -> {
             try {
                 ReplyPictures result = fetch(type, oid, root, rpid);
                 if (result != null && !result.pictures.isEmpty()) {
                     CACHE.put(key, result);
-                    // A second holder/text pass can occur while the request is
-                    // in flight. Retry briefly so the first visible load does
-                    // not depend on recycling the row or reopening the page.
-                    long[] delays = {0L, 80L, 300L};
-                    for (long delay : delays) {
-                        MAIN.postDelayed(
-                                () -> renderIfCurrent(messageView, itemView, key,
-                                        generation, result),
-                                delay);
-                    }
+                    deliverRenderTargets(key, result);
                 } else {
                     CACHE.put(key, null);
+                    PENDING_TARGETS.remove(key);
                 }
             } catch (Throwable throwable) {
+                PENDING_TARGETS.remove(key);
                 XposedBridge.log("BiliPartFix: picture lookup failed for rpid=" + rpid
                         + ": " + throwable.getClass().getSimpleName());
             } finally {
                 IN_FLIGHT.remove(key);
             }
         });
+    }
+
+    private static void queueRenderTarget(String key, TextView messageView, View itemView,
+                                          int generation) {
+        List<RenderTarget> targets = PENDING_TARGETS.computeIfAbsent(
+                key, ignored -> Collections.synchronizedList(new ArrayList<>()));
+        targets.add(new RenderTarget(messageView, itemView, generation));
+    }
+
+    private static void deliverRenderTargets(String key, ReplyPictures result) {
+        List<RenderTarget> targets = PENDING_TARGETS.remove(key);
+        if (targets == null) return;
+        List<RenderTarget> snapshot;
+        synchronized (targets) {
+            snapshot = new ArrayList<>(targets);
+        }
+        long[] delays = {0L, 80L, 300L};
+        for (RenderTarget target : snapshot) {
+            for (long delay : delays) {
+                MAIN.postDelayed(() -> target.render(key, result), delay);
+            }
+        }
+    }
+
+    private static CharSequence rawCommentMessage(Object comment) {
+        if (comment == null) return null;
+        try {
+            Object content = XposedHelpers.getObjectField(comment, "mContent");
+            return content == null ? null
+                    : (CharSequence) XposedHelpers.getObjectField(content, "mMsg");
+        } catch (Throwable throwable) {
+            XposedBridge.log("BiliPartFix: unable to inspect raw comment message: "
+                    + throwable.getClass().getSimpleName());
+            return null;
+        }
     }
 
     private static CommentIdentity identityFromViewModel(Object viewModel) {
@@ -301,8 +362,7 @@ final class CommentImageFix {
                                         String key, int generation, ReplyPictures result) {
         if (!key.equals(BOUND_KEYS.get(itemView))
                 || generation != currentGeneration(itemView)
-                || key.equals(RENDERED_KEYS.get(itemView))
-                || !containsUpgradeMarker(messageView.getText())) {
+                || key.equals(RENDERED_KEYS.get(itemView))) {
             return;
         }
         try {
@@ -321,12 +381,14 @@ final class CommentImageFix {
             for (int i = 0; i < count; i++) {
                 Picture picture = result.pictures.get(i);
                 View image = slots[i];
+                int clickedIndex = i;
                 image.setBackgroundColor(Color.rgb(238, 238, 238));
                 image.setVisibility(View.VISIBLE);
                 image.setContentDescription(result.pictures.size() > slots.length
                         ? "共" + result.pictures.size() + "张图片，点击查看全部"
                         : "评论图片，点击查看大图");
-                image.setOnClickListener(v -> showPictureDialog(messageView, result));
+                image.setOnClickListener(
+                        v -> showNativePictureViewer(messageView, result, clickedIndex));
                 loadWithBiliImageLoader(messageView, image, picture.url);
             }
             // Do not remove the server marker until every image request has
@@ -334,6 +396,7 @@ final class CommentImageFix {
             stripUpgradeMarker(messageView);
             messageView.postDelayed(() -> stripUpgradeMarker(messageView), 120);
             messageView.postDelayed(() -> stripUpgradeMarker(messageView), 500);
+            installMarkerWatcher(messageView, itemView, key, generation);
             itemView.requestLayout();
             itemView.invalidate();
             RENDERED_KEYS.put(itemView, key);
@@ -466,61 +529,50 @@ final class CommentImageFix {
         }
     }
 
-    /**
-     * The 7.4.0 comment layout physically provides only three picture slots.
-     * Keep that compact inline layout, but expose every returned picture (up to
-     * the service limit of nine) in a native, on-demand gallery. This avoids a
-     * WebView and does not allocate the extra image views until the user taps.
-     */
-    private static void showPictureDialog(View anchor, ReplyPictures result) {
+    private static void showNativePictureViewer(View anchor, ReplyPictures result,
+                                                int clickedIndex) {
         try {
-            Dialog dialog = new Dialog(anchor.getContext());
-            ScrollView scroll = new ScrollView(anchor.getContext());
-            scroll.setBackgroundColor(Color.rgb(20, 20, 20));
-            LinearLayout column = new LinearLayout(anchor.getContext());
-            column.setOrientation(LinearLayout.VERTICAL);
-            column.setGravity(Gravity.CENTER_HORIZONTAL);
-            int padding = dp(anchor, 12);
-            column.setPadding(padding, padding, padding, padding);
-            scroll.addView(column, new ScrollView.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT));
-
-            int width = anchor.getResources().getDisplayMetrics().widthPixels
-                    - padding * 2;
+            Activity activity = findActivity(anchor.getContext());
+            if (activity == null) throw new IllegalStateException("activity context unavailable");
+            Class<?> imageItemClass = XposedHelpers.findClass(IMAGE_ITEM, appClassLoader);
+            List<Object> items = new ArrayList<>(result.pictures.size());
             for (Picture picture : result.pictures) {
-                View image = (View) XposedHelpers.newInstance(
-                        biliImageViewClass, anchor.getContext());
-                int height = picture.width > 0 && picture.height > 0
-                        ? Math.round(width * (picture.height / (float) picture.width))
-                        : width;
-                height = Math.max(dp(anchor, 160), Math.min(height, dp(anchor, 720)));
-                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, height);
-                params.bottomMargin = padding;
-                image.setLayoutParams(params);
-                image.setBackgroundColor(Color.rgb(40, 40, 40));
-                image.setContentDescription("评论图片");
-                column.addView(image);
-                loadWithBiliImageLoader(anchor, image, picture.url);
+                String url = normalizeUrl(picture.url);
+                items.add(XposedHelpers.newInstance(imageItemClass,
+                        url, null, url, url, picture.width, picture.height, 0));
             }
-
-            dialog.setContentView(scroll);
-            dialog.setCanceledOnTouchOutside(true);
-            dialog.show();
-            Window window = dialog.getWindow();
-            if (window != null) {
-                window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT);
-            }
+            Class<?> modelClass = XposedHelpers.findClass(IMAGE_VIEWER_MODEL, appClassLoader);
+            Object model = XposedHelpers.newInstance(modelClass, activity);
+            XposedHelpers.callMethod(model, "d", items);
+            XposedHelpers.callMethod(model, "g", Math.max(0,
+                    Math.min(clickedIndex, items.size() - 1)));
+            XposedHelpers.callMethod(model, "f");
+            XposedHelpers.callMethod(model, "c");
+            XposedHelpers.callMethod(model, "e");
         } catch (Throwable throwable) {
-            XposedBridge.log("BiliPartFix: picture dialog failed: " + throwable);
+            XposedBridge.log("BiliPartFix: native picture viewer failed: " + throwable);
         }
+    }
+
+    private static Activity findActivity(Context context) {
+        Context current = context;
+        while (current instanceof ContextWrapper) {
+            if (current instanceof Activity) return (Activity) current;
+            Context base = ((ContextWrapper) current).getBaseContext();
+            if (base == current) break;
+            current = base;
+        }
+        return current instanceof Activity ? (Activity) current : null;
+    }
+
+    private static String normalizeUrl(String rawUrl) {
+        return rawUrl.startsWith("http://")
+                ? "https://" + rawUrl.substring("http://".length()) : rawUrl;
     }
 
     private static void loadWithBiliImageLoader(View contextView, View image, String rawUrl)
             throws Exception {
-        String url = rawUrl.startsWith("http://")
-                ? "https://" + rawUrl.substring("http://".length()) : rawUrl;
+        String url = normalizeUrl(rawUrl);
         Class<?> loaderClass = XposedHelpers.findClass(BILI_IMAGE_LOADER, appClassLoader);
         Object loader = XposedHelpers.getStaticObjectField(loaderClass, "INSTANCE");
         Object builder = XposedHelpers.callMethod(loader, "with", contextView.getContext());
@@ -567,7 +619,7 @@ final class CommentImageFix {
         connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("Accept", "application/json");
         connection.setRequestProperty("Accept-Encoding", "identity");
-        connection.setRequestProperty("User-Agent", "BiliPartFix/1.2 (Android)");
+        connection.setRequestProperty("User-Agent", "BiliPartFix/1.5 (Android)");
         try {
             if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
             byte[] bytes = readBounded(connection);
@@ -666,6 +718,39 @@ final class CommentImageFix {
         CharSequence strippedDescription = stripUpgradeMarker(description);
         if (strippedDescription != description) {
             view.setContentDescription(strippedDescription);
+        }
+    }
+
+    private static void installMarkerWatcher(TextView messageView, View itemView,
+                                             String key, int generation) {
+        synchronized (MARKER_WATCHERS) {
+            MarkerWatchState existing = MARKER_WATCHERS.get(messageView);
+            if (existing != null && existing.matches(key, generation)) return;
+            if (existing != null) {
+                messageView.removeOnLayoutChangeListener(existing.listener);
+            }
+            View.OnLayoutChangeListener listener = (view, left, top, right, bottom,
+                                                     oldLeft, oldTop, oldRight, oldBottom) -> {
+                if (key.equals(BOUND_KEYS.get(itemView))
+                        && generation == currentGeneration(itemView)) {
+                    MemoryCache.Lookup<ReplyPictures> cached = CACHE.get(key);
+                    if (cached.present && cached.value != null) {
+                        stripUpgradeMarker(messageView);
+                    }
+                }
+            };
+            messageView.addOnLayoutChangeListener(listener);
+            MARKER_WATCHERS.put(messageView,
+                    new MarkerWatchState(key, generation, listener));
+        }
+    }
+
+    private static void clearMarkerWatcher(TextView messageView) {
+        synchronized (MARKER_WATCHERS) {
+            MarkerWatchState existing = MARKER_WATCHERS.remove(messageView);
+            if (existing != null) {
+                messageView.removeOnLayoutChangeListener(existing.listener);
+            }
         }
     }
 
@@ -769,6 +854,42 @@ final class CommentImageFix {
         IdentityFields(Field meta, Field context) {
             this.meta = meta;
             this.context = context;
+        }
+    }
+
+    private static final class RenderTarget {
+        final WeakReference<TextView> messageView;
+        final WeakReference<View> itemView;
+        final int generation;
+
+        RenderTarget(TextView messageView, View itemView, int generation) {
+            this.messageView = new WeakReference<>(messageView);
+            this.itemView = new WeakReference<>(itemView);
+            this.generation = generation;
+        }
+
+        void render(String key, ReplyPictures result) {
+            TextView message = messageView.get();
+            View item = itemView.get();
+            if (message != null && item != null) {
+                renderIfCurrent(message, item, key, generation, result);
+            }
+        }
+    }
+
+    private static final class MarkerWatchState {
+        final String key;
+        final int generation;
+        final View.OnLayoutChangeListener listener;
+
+        MarkerWatchState(String key, int generation, View.OnLayoutChangeListener listener) {
+            this.key = key;
+            this.generation = generation;
+            this.listener = listener;
+        }
+
+        boolean matches(String otherKey, int otherGeneration) {
+            return generation == otherGeneration && key.equals(otherKey);
         }
     }
 }
