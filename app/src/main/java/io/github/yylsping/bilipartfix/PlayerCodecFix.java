@@ -126,6 +126,7 @@ final class PlayerCodecFix {
                     }
                 });
         XposedBridge.log(host + " Smart Auto codec policy installed; capability detection=lazy");
+        if (BuildConfig.DEBUG) HfrControlHarness.install(classLoader);
         if (BuildConfig.DEBUG && host == HostVersion.V7040300) {
             // The read-only research instrumentation hardcodes 7040300 symbols.
             LiveCodecResearch.install(context, classLoader);

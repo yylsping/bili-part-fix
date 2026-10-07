@@ -4,6 +4,7 @@ import org.json.JSONObject;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.function.ToIntFunction;
 
 /**
  * Reads the selected DASH representation already resolved by the host.
@@ -70,13 +71,8 @@ final class StreamInfoExtractor {
             if (dash == null) return null;
             Object value = XposedHelpers.callMethod(dash, "h");
             if (!(value instanceof List)) return null;
-            for (Object index : (List<?>) value) {
-                if (index != null
-                        && intMethod(index, profile.dashQualityGetter,
-                                Integer.MIN_VALUE) == qualityId) {
-                    return index;
-                }
-            }
+            return uniqueQualityMatch((List<?>) value, qualityId,
+                    index -> intMethod(index, profile.dashQualityGetter, Integer.MIN_VALUE));
         } catch (Throwable throwable) {
             if (BuildConfig.DEBUG) {
                 XposedBridge.log("BiliPartFix/SmartAuto: selected DASH lookup failed",
@@ -84,6 +80,23 @@ final class StreamInfoExtractor {
             }
         }
         return null;
+    }
+
+    /** A quality id identifies a group, not a representation. Ambiguity stays unknown. */
+    static <T> T uniqueQualityMatch(List<T> candidates, int qualityId,
+                                    ToIntFunction<T> qualityGetter) {
+        if (candidates == null || qualityId <= 0) return null;
+        T match = null;
+        for (T candidate : candidates) {
+            if (candidate == null) continue;
+            int candidateQuality = qualityGetter.applyAsInt(candidate);
+            // An unreadable candidate could be a second match; do not assert uniqueness.
+            if (candidateQuality == Integer.MIN_VALUE) return null;
+            if (candidateQuality != qualityId) continue;
+            if (match != null) return null;
+            match = candidate;
+        }
+        return match;
     }
 
     private DecoderPolicy.HdrState hdrState(Object options) {
@@ -120,14 +133,19 @@ final class StreamInfoExtractor {
     static float parseFrameRate(String value) {
         if (value == null) return 0f;
         try {
-            String clean = value.trim().toLowerCase(Locale.ROOT).replace("fps", "").trim();
+            String clean = value.trim().toLowerCase(Locale.ROOT);
+            if (clean.endsWith("fps")) clean = clean.substring(0, clean.length() - 3).trim();
             int slash = clean.indexOf('/');
+            float result;
             if (slash > 0) {
                 float numerator = Float.parseFloat(clean.substring(0, slash).trim());
                 float denominator = Float.parseFloat(clean.substring(slash + 1).trim());
-                return denominator > 0f ? numerator / denominator : 0f;
+                if (numerator <= 0f || denominator <= 0f) return 0f;
+                result = numerator / denominator;
+            } else {
+                result = Float.parseFloat(clean);
             }
-            return Float.parseFloat(clean);
+            return Float.isFinite(result) && result > 0f ? result : 0f;
         } catch (Throwable ignored) {
             return 0f;
         }

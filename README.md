@@ -63,6 +63,10 @@
 
 测试 APK 输出到 `app/build/outputs/apk/debug/`。面向普通用户的已签名版本请从 GitHub Releases 下载。
 
+## 高帧率研究记录
+
+同一画质 qn 存在多个 representation 时，Smart Auto 保守保留宿主选择。该修正并不代表目标视频已实现 4K120fps 播放。研究边界、DEBUG 本地对照和验证范围见[研究记录](docs/hfr-investigation.md)。
+
 ## 相关项目
 
 - [bili hook](https://github.com/yylsping/bili-hook)：面向哔哩哔哩 7.4.0 与 7.42.0，提供画质解锁与去广告功能。
