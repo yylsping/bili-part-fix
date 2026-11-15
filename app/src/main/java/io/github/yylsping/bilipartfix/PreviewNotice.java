@@ -23,9 +23,17 @@ final class PreviewNotice {
     private static final String TAG = "bilipartfix:preview-notice";
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<Activity, Boolean> ACTIVITIES = new WeakHashMap<>();
+    private static final Map<Activity, Long> BOUND_IDENTITIES = new WeakHashMap<>();
     private static final MemoryCache<Long, Notice> NOTICES = new MemoryCache<>(32, 300_000L, 1_000L);
 
     private PreviewNotice() {}
+
+    /** 7.42.0 supplies its already-resolved identity from the detail callback. Main thread only. */
+    static void bind(Activity activity, long aid) {
+        BOUND_IDENTITIES.put(activity, aid);
+        ACTIVITIES.put(activity, true);
+        schedule(activity);
+    }
 
     static void install() {
         XposedBridge.hookAllMethods(Activity.class, "performResume", new XC_MethodHook() {
@@ -71,7 +79,11 @@ final class PreviewNotice {
     private static boolean render(Activity activity) {
         if (activity.isFinishing() || activity.isDestroyed()) return true;
         long aid = videoId(activity);
-        int id = activity.getResources().getIdentifier("videoview_container_page", "id", "tv.danmaku.bili");
+        boolean boundHost = BOUND_IDENTITIES.containsKey(activity);
+        // On 7.42 the player touch layer is a sibling of the video container.
+        // Put the notice above it, leaving the native back/home/overflow targets free.
+        int id = activity.getResources().getIdentifier(
+                boundHost ? "reveal_placeholder" : "videoview_container_page", "id", "tv.danmaku.bili");
         View found = activity.findViewById(id);
         if (!(found instanceof FrameLayout)) return false;
         FrameLayout host = (FrameLayout) found;
@@ -93,10 +105,17 @@ final class PreviewNotice {
             int padding = Math.round(8 * activity.getResources().getDisplayMetrics().density);
             banner.setPadding(padding, padding / 2, padding, padding / 2);
             banner.setGravity(Gravity.CENTER_VERTICAL);
-            host.addView(banner, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP));
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP);
+            if (boundHost) {
+                params.leftMargin = Math.round(96 * activity.getResources().getDisplayMetrics().density);
+                params.rightMargin = Math.round(40 * activity.getResources().getDisplayMetrics().density);
+            }
+            host.addView(banner, params);
         }
-        Uri destination = safeDestination(notice.link);
+        // 7.42's native player intercepts touches inside this status area. Keep it
+        // informational; the existing creator-page charge entry remains available.
+        Uri destination = boundHost ? null : safeDestination(notice.link);
         banner.setText(notice.message + (destination == null ? "" : "  ›"));
         banner.setOnClickListener(destination == null ? null : view -> {
             try {
@@ -138,6 +157,8 @@ final class PreviewNotice {
     }
 
     private static long videoId(Activity activity) {
+        Long bound = BOUND_IDENTITIES.get(activity);
+        if (bound != null) return bound;
         // BV search routes keep a BV identifier in the Intent. Use the identity
         // already resolved by the native detail model, also covering in-page changes.
         try {

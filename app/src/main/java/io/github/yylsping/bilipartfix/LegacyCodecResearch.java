@@ -3,6 +3,7 @@ package io.github.yylsping.bilipartfix;
 import android.content.Context;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.os.Build;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -61,7 +62,8 @@ final class LegacyCodecResearch {
                             : XposedHelpers.getIntField(candidate, "mRank");
                     String hardware;
                     try {
-                        hardware = String.valueOf(info.isHardwareAccelerated());
+                        hardware = Build.VERSION.SDK_INT >= 29
+                                ? String.valueOf(info.isHardwareAccelerated()) : "unknown";
                     } catch (Throwable ignored) {
                         hardware = "unknown";
                     }

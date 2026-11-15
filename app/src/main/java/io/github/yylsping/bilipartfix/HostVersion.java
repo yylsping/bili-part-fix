@@ -31,8 +31,8 @@ public enum HostVersion {
 
     /**
      * Whether this host gets the full legacy fix set. Only 7040300 does;
-     * 7420400 installs the multipart, watch-later and decoder-mode fixes,
-     * everything else has been verified native-OK on that host.
+     * 7420400 installs its own multipart, watch-later, decoder-mode,
+     * charge-trial and image-save fixes, retaining native content rendering.
      */
     public boolean installsLegacyFixes() {
         return this == V7040300;

@@ -14,9 +14,8 @@ import io.github.libxposed.api.XposedModuleInterface;
 /**
  * Modern libxposed API 102 entry point for the Bilibili compatibility fixes.
  * Supported hosts: 7.4.0 (7040300) and 7.42.0 (7420400). The 7.42.0 build
- * installs the fixes with reproduced on-device evidence plus the decoder
- * mode entry and Smart Auto policy via the 7420400 DecoderProfile; features
- * that the newer host already handles natively are deliberately not hooked.
+ * installs the multipart, watch-later, charge-trial and image-save fixes plus
+ * the decoder mode entry and Smart Auto policy via the 7420400 DecoderProfile.
  */
 public final class BiliPartFixHook extends XposedModule {
     private static final String TARGET_PACKAGE = "tv.danmaku.bili";
@@ -77,17 +76,15 @@ public final class BiliPartFixHook extends XposedModule {
     private void installMainProcess(Context context, ClassLoader classLoader, HostVersion host) {
         boolean multipart = installDataSourceFix(classLoader, host);
         if (!host.installsLegacyFixes()) {
-            // Reproduced on 7420400: the multi-page UGC-season routing problem
-            // and the legacy watch-later Page.cid int overflow (same fastjson
-            // model and BiliCall.m/n hook points as 7040300). The decoder
-            // settings entry and Smart Auto policy are installed through the
-            // 7420400 DecoderProfile (see docs/7420400-decoder-mapping.md).
-            // Everything else is intentionally left to the host app. A failure
-            // of one feature must not block or mask the others.
+            // Each independently reproduced compatibility issue has its own
+            // installer. Leave native content rendering and browsing intact;
+            // a failure of one feature must not mask the others.
             boolean watchLater = WatchLaterFix.install(classLoader);
+            boolean trialPreview = TrialPreviewFix.install(classLoader);
+            boolean imageSave = ImageSaveFix.install(classLoader);
             CodecInstallResult codecResult = installCodecFixes(context, classLoader, host);
             XposedBridge.log(FeatureInstallSummary.of7420400(multipart, watchLater,
-                    codecResult.codecInstalled, codecResult.settingsInstalled));
+                    codecResult.codecInstalled, codecResult.settingsInstalled, trialPreview, imageSave));
             return;
         }
         if (!multipart) {

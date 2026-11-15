@@ -3,6 +3,7 @@ package io.github.yylsping.bilipartfix;
 import android.content.Context;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.os.Build;
 import android.text.TextUtils;
 
 /** Debug-only, read-only instrumentation for the 7040300 live IJK codec path. */
@@ -111,7 +112,8 @@ final class LiveCodecResearch {
                 int rank = candidate == null ? -1
                         : XposedHelpers.getIntField(candidate, "mRank");
                 return "rank=" + rank
-                        + ", hardware=" + info.isHardwareAccelerated()
+                        + ", hardware=" + (Build.VERSION.SDK_INT >= 29
+                                ? String.valueOf(info.isHardwareAccelerated()) : "unknown")
                         + ", lowLatency=" + selected.toLowerCase().contains("low_latency");
             }
         } catch (Throwable throwable) {
